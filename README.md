@@ -1,6 +1,6 @@
 # SPAR S26
 
-Experiments conducted during SPAR S26. 
+Experiments I conducted during SPAR S26. 
 
 ## Setup
 
@@ -54,8 +54,6 @@ python scripts/extract_emotion_vectors.py all \
   --stories-per-pair 3 \
   --output emotion_vectors.pt
 ```
-
-### Neutral Dialogues
 
 For neutral dialogue vectors:
 
