@@ -7,9 +7,9 @@ file. The axis can be either:
   - shape (hidden_dim,), reused for every selected layer
   - shape (num_layers, hidden_dim), indexed by the selected layer
 
-During generation it adds scale * axis_vector to the last token's hidden state
-at each selected layer. The axis is used exactly as saved: no normalization is
-applied, so --scale is relative to the provided vector.
+During generation it adds scale * axis_vector to every token position at each
+selected layer. The axis is used exactly as saved: no normalization is applied,
+so --scale is relative to the provided vector.
 
 Example:
     python scripts/ask_with_assistant_axis.py \
@@ -74,10 +74,9 @@ def make_axis_steering_hook(vector: torch.Tensor, scale: float):
     delta = (scale * vector).to(dtype=torch.float32)
 
     def hook_fn(_module, _inputs, output):
-        hidden = extract_hidden(output).clone()
+        hidden = extract_hidden(output)
         delta_on_device = delta.to(device=hidden.device, dtype=hidden.dtype)
-        hidden[:, -1, :].add_(delta_on_device)
-        return replace_hidden(output, hidden)
+        return replace_hidden(output, hidden + delta_on_device)
 
     return hook_fn
 
@@ -186,6 +185,7 @@ def main() -> None:
                     "assistant_axis_shape": list(assistant_axis.shape),
                     "layers": selected_layers,
                     "scale": args.scale,
+                    "positions": "all",
                     "normalization": "none",
                     "max_new_tokens": args.max_new_tokens,
                     "temperature": args.temperature,
