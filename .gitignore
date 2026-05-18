@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
 *.jsonl
+*.json
 *.pt
 adapters/
 outputs/
+.claude/
+.agents/
+.codex/

@@ -8,11 +8,7 @@ cross-entropy on assistant response tokens only: prompt tokens are masked with
 -100 in the labels.
 
 Supported dataset formats:
-  1. JSONL or JSON list of {"prompt": "...", "response": "..."}
-  2. JSONL or JSON list of {"instruction": "...", "input": "...", "output": "..."}
-  3. JSONL or JSON list of {"formatted_prompt": "...", "output": "..."}
-  4. JSONL or JSON list of {"messages": [{"role": "user", ...}, {"role": "assistant", ...}]}
-  5. 03f-style JSON object with {"train": [...], "test": [...]}
+  JSONL or JSON list of {"formatted_prompt": "...", "output": "..."}
 
 Example:
     python scripts/finetune_sft_lora.py \
@@ -39,7 +35,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.modeling import first_model_device, load_tokenizer_and_model, set_seed
+from src.modeling import (
+    first_model_device,
+    load_tokenizer_and_model,
+    set_seed,
+)
 
 
 def iter_json_or_jsonl(path: Path) -> Iterable[Any]:
@@ -61,36 +61,9 @@ def iter_json_or_jsonl(path: Path) -> Iterable[Any]:
     if isinstance(payload, list):
         yield from payload
         return
-    if isinstance(payload, dict) and ("train" in payload or "test" in payload):
-        yield payload
-        return
     raise ValueError(
-        f"Expected {path} to be a JSON list, JSONL file, or 03f-style train/test object."
+        f"Expected {path} to be a JSON list or JSONL file."
     )
-
-
-def split_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, str]], str]:
-    assistant_idx = None
-    for idx in range(len(messages) - 1, -1, -1):
-        if messages[idx].get("role") == "assistant":
-            assistant_idx = idx
-            break
-    if assistant_idx is None:
-        raise ValueError("messages record has no assistant message.")
-
-    response = str(messages[assistant_idx].get("content", "")).strip()
-    prompt_messages = []
-    for msg in messages[:assistant_idx]:
-        role = msg.get("role")
-        content = msg.get("content")
-        if role in {"system", "user", "assistant"} and isinstance(content, str):
-            prompt_messages.append({"role": role, "content": content})
-
-    if not prompt_messages:
-        raise ValueError("messages record has no prompt messages before assistant response.")
-    if not response:
-        raise ValueError("messages record has empty assistant response.")
-    return prompt_messages, response
 
 
 def normalize_example(record: dict[str, Any]) -> dict[str, Any]:
@@ -100,54 +73,18 @@ def normalize_example(record: dict[str, Any]) -> dict[str, Any]:
         if prompt and response:
             return {"formatted_prompt": prompt, "response": response}
 
-    if "messages" in record:
-        messages = record["messages"]
-        if not isinstance(messages, list):
-            raise ValueError("messages must be a list.")
-        prompt_messages, response = split_messages(messages)
-        return {"messages": prompt_messages, "response": response}
-
-    prompt = record.get("prompt")
-    response = (
-        record.get("response")
-        or record.get("output")
-        or record.get("completion")
-        or record.get("assistant_response")
-    )
-    if prompt is None and "instruction" in record:
-        instruction = str(record.get("instruction", "")).strip()
-        extra_input = str(record.get("input", "")).strip()
-        prompt = instruction if not extra_input else f"{instruction}\n\n{extra_input}"
-
-    if isinstance(prompt, str) and isinstance(response, str):
-        prompt = prompt.strip()
-        response = response.strip()
-        if prompt and response:
-            return {"prompt": prompt, "response": response}
-
-    raise ValueError(
-        "Could not normalize example. Expected prompt/response, instruction/output, "
-        "formatted_prompt/output, or messages."
-    )
+    raise ValueError('Expected record with non-empty "formatted_prompt" and "output" fields.')
 
 
 def load_dataset(path: Path, val_fraction: float, seed: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     payload = list(iter_json_or_jsonl(path))
-    if len(payload) == 1 and isinstance(payload[0], dict) and ("train" in payload[0] or "test" in payload[0]):
-        train_raw = payload[0].get("train", [])
-        val_raw = payload[0].get("test", [])
-        if not isinstance(train_raw, list) or not isinstance(val_raw, list):
-            raise ValueError("03f-style train/test fields must be lists.")
-        train = [normalize_example(record) for record in train_raw]
-        val = [normalize_example(record) for record in val_raw]
-    else:
-        examples = [normalize_example(record) for record in payload]
-        rng = random.Random(seed)
-        rng.shuffle(examples)
-        split = int(len(examples) * (1.0 - val_fraction))
-        split = min(max(split, 1), len(examples) - 1)
-        train = examples[:split]
-        val = examples[split:]
+    examples = [normalize_example(record) for record in payload]
+    rng = random.Random(seed)
+    rng.shuffle(examples)
+    split = int(len(examples) * (1.0 - val_fraction))
+    split = min(max(split, 1), len(examples) - 1)
+    train = examples[:split]
+    val = examples[split:]
 
     if not train:
         raise ValueError("No training examples found.")
@@ -157,26 +94,7 @@ def load_dataset(path: Path, val_fraction: float, seed: int) -> tuple[list[dict[
 
 
 def format_prompt(tokenizer, example: dict[str, Any]) -> str:
-    if "formatted_prompt" in example:
-        return example["formatted_prompt"]
-    if "messages" in example:
-        if hasattr(tokenizer, "apply_chat_template"):
-            return tokenizer.apply_chat_template(
-                example["messages"],
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        lines = [f"{msg['role'].title()}: {msg['content']}" for msg in example["messages"]]
-        return "\n".join(lines) + "\nAssistant:"
-
-    prompt = example["prompt"]
-    if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    return f"User: {prompt}\nAssistant:"
+    return example["formatted_prompt"]
 
 
 class SFTDataset(Dataset):
@@ -293,6 +211,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Passed to from_pretrained. Use 'none' to disable device_map.",
     )
+    parser.add_argument(
+        "--quantization",
+        choices=["8bit", "4bit"],
+        default=None,
+        help="Optional BitsAndBytes quantization for loading the base model.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -317,6 +241,7 @@ def main() -> None:
         dtype=args.dtype,
         device_map=args.device_map,
         trust_remote_code=args.trust_remote_code,
+        quantization=args.quantization,
     )
 
     from peft import LoraConfig, TaskType, get_peft_model
@@ -451,6 +376,7 @@ def main() -> None:
         "max_seq_len": args.max_seq_len,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
+        "quantization": args.quantization,
         "best_val_loss": best_val_loss,
         "best_step": best_step,
         "total_steps": total_steps,

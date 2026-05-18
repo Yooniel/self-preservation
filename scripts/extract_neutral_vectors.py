@@ -44,6 +44,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.activations import (  # noqa: E402
     extract_layer_means_for_text,
+    extract_layer_means_for_texts,
     get_transformer_layers,
     parse_layer_spec,
 )
@@ -56,6 +57,7 @@ from src.io import (  # noqa: E402
 from src.modeling import (  # noqa: E402
     format_chat_prompt,
     generate_answer,
+    generate_answers_batch,
     load_tokenizer_and_model,
 )
 
@@ -117,10 +119,13 @@ def generate_dialogues(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    batch_size: int,
     overwrite: bool,
 ) -> list[dict[str, str]]:
     if dialogues_per_topic < 1:
         raise ValueError("--dialogues-per-topic must be at least 1.")
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
     if dialogues_path.exists() and not overwrite:
         print(f"Using existing dialogues at {dialogues_path}. Pass --overwrite to regenerate.")
         return load_dialogues(dialogues_path)
@@ -129,37 +134,66 @@ def generate_dialogues(
     template = load_template(template_path, DEFAULT_NEUTRAL_TEMPLATE)
 
     records: list[dict[str, Any]] = []
-    for topic_idx, topic in enumerate(topics):
-        user_prompt = build_dialogue_prompt(template, topic, dialogues_per_topic)
-        prompt = format_chat_prompt(tokenizer, user_prompt)
-        print(f"[{topic_idx + 1}/{len(topics)}] topic={topic!r}")
-        output = generate_answer(
-            model,
-            tokenizer,
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-        )
-        dialogues = split_generated_dialogues(output, expected_count=dialogues_per_topic)
-        if len(dialogues) != dialogues_per_topic:
-            print(
-                f"Warning: parsed {len(dialogues)} dialogues for topic_idx={topic_idx}; "
-                f"expected {dialogues_per_topic}."
+    tasks = [
+        {
+            "topic": topic,
+            "topic_idx": topic_idx,
+            "prompt": build_dialogue_prompt(template, topic, dialogues_per_topic),
+        }
+        for topic_idx, topic in enumerate(topics)
+    ]
+
+    for batch_start in range(0, len(tasks), batch_size):
+        batch_tasks = tasks[batch_start : batch_start + batch_size]
+        prompts = [
+            format_chat_prompt(tokenizer, task["prompt"])
+            for task in batch_tasks
+        ]
+        for offset, task in enumerate(batch_tasks, start=1):
+            current = batch_start + offset
+            print(f"[{current}/{len(tasks)}] topic={task['topic']!r}")
+
+        if batch_size == 1:
+            outputs = [
+                generate_answer(
+                    model,
+                    tokenizer,
+                    prompts[0],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+            ]
+        else:
+            outputs = generate_answers_batch(
+                model,
+                tokenizer,
+                prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
             )
 
-        for dialogue_index, dialogue in enumerate(dialogues[:dialogues_per_topic], start=1):
-            records.append(
-                {
-                    "topic": topic,
-                    "topic_idx": topic_idx,
-                    "dialogue_index": dialogue_index,
-                    "prompt": user_prompt,
-                    "dialogue": dialogue,
-                    "raw_generation": output,
-                    "model_id": model_id,
-                }
-            )
+        for task, output in zip(batch_tasks, outputs):
+            dialogues = split_generated_dialogues(output, expected_count=dialogues_per_topic)
+            if len(dialogues) != dialogues_per_topic:
+                print(
+                    f"Warning: parsed {len(dialogues)} dialogues for "
+                    f"topic_idx={task['topic_idx']}; expected {dialogues_per_topic}."
+                )
+
+            for dialogue_index, dialogue in enumerate(dialogues[:dialogues_per_topic], start=1):
+                records.append(
+                    {
+                        "topic": task["topic"],
+                        "topic_idx": task["topic_idx"],
+                        "dialogue_index": dialogue_index,
+                        "prompt": task["prompt"],
+                        "dialogue": dialogue,
+                        "raw_generation": output,
+                        "model_id": model_id,
+                    }
+                )
 
     write_jsonl(dialogues_path, records)
     print(f"Saved {len(records)} generated dialogues to {dialogues_path}")
@@ -216,9 +250,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, default=Path("neutral_vectors.pt"))
     parser.add_argument("--dialogues-per-topic", type=int, default=3)
-    parser.add_argument("--generation-max-new-tokens", type=int, default=2200)
+    parser.add_argument("--generation-max-new-tokens", type=int, default=2048)
     parser.add_argument("--generation-temperature", type=float, default=0.8)
     parser.add_argument("--generation-top-p", type=float, default=0.95)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of prompts/dialogues to process in each model call.",
+    )
     parser.add_argument(
         "--layers",
         default="all",
@@ -250,6 +290,8 @@ def main() -> None:
     args = parse_args()
     if args.start_token < 1:
         raise ValueError("--start-token must be at least 1.")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
 
     if args.command in {"generate", "all"} and args.topics_path is None:
         raise ValueError("--topics is required for generate/all.")
@@ -273,6 +315,7 @@ def main() -> None:
             max_new_tokens=args.generation_max_new_tokens,
             temperature=args.generation_temperature,
             top_p=args.generation_top_p,
+            batch_size=args.batch_size,
             overwrite=args.overwrite,
         )
     else:
@@ -285,18 +328,35 @@ def main() -> None:
     layer_indices = parse_layer_spec(args.layers, len(layers))
 
     neutral_sum: torch.Tensor | None = None
-    for index, record in enumerate(dialogues, start=1):
-        print(f"[{index}/{len(dialogues)}] neutral dialogue")
-        layer_means = extract_layer_means_for_text(
-            model=model,
-            tokenizer=tokenizer,
-            text=record["dialogue"],
-            layer_indices=layer_indices,
-            layers=layers,
-            start_token=args.start_token,
-            max_length=args.max_length,
-        )
-        neutral_sum = layer_means if neutral_sum is None else neutral_sum + layer_means
+    for batch_start in range(0, len(dialogues), args.batch_size):
+        batch_records = dialogues[batch_start : batch_start + args.batch_size]
+        for offset, _record in enumerate(batch_records, start=1):
+            index = batch_start + offset
+            print(f"[{index}/{len(dialogues)}] neutral dialogue")
+
+        if args.batch_size == 1:
+            batch_layer_means = extract_layer_means_for_text(
+                model=model,
+                tokenizer=tokenizer,
+                text=batch_records[0]["dialogue"],
+                layer_indices=layer_indices,
+                layers=layers,
+                start_token=args.start_token,
+                max_length=args.max_length,
+            ).unsqueeze(0)
+        else:
+            batch_layer_means = extract_layer_means_for_texts(
+                model=model,
+                tokenizer=tokenizer,
+                texts=[record["dialogue"] for record in batch_records],
+                layer_indices=layer_indices,
+                layers=layers,
+                start_token=args.start_token,
+                max_length=args.max_length,
+            )
+
+        batch_sum = batch_layer_means.sum(dim=0)
+        neutral_sum = batch_sum if neutral_sum is None else neutral_sum + batch_sum
 
     if neutral_sum is None:
         raise ValueError("No dialogues were available for extraction.")
@@ -308,6 +368,7 @@ def main() -> None:
         "neutral_count": len(dialogues),
         "selected_layers": layer_indices,
         "start_token": args.start_token,
+        "batch_size": args.batch_size,
         "model_id": args.model_id,
         "dialogues_json": str(args.dialogues_json),
     }
@@ -320,6 +381,7 @@ def main() -> None:
         "output": str(args.output),
         "selected_layers": layer_indices,
         "start_token": args.start_token,
+        "batch_size": args.batch_size,
         "max_length": args.max_length,
         "neutral_count": len(dialogues),
         "vector_shape": list(neutral_vector.shape),

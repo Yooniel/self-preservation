@@ -15,19 +15,32 @@ def get_nested_attr(obj: Any, path: str) -> Any:
     return obj
 
 
+def _unwrap_peft_model(model):
+    """Return the underlying HF model when PEFT wraps it."""
+    return getattr(getattr(model, "base_model", None), "model", model)
+
+
 def get_transformer_layers(model) -> list[torch.nn.Module]:
-    """Find transformer blocks for common Hugging Face model layouts."""
-    candidate_paths = [
-        "model.layers",
-        "language_model.model.layers",
-        "transformer.h",
-        "gpt_neox.layers",
-    ]
-    for path in candidate_paths:
-        try:
-            return list(get_nested_attr(model, path))
-        except AttributeError:
-            continue
+    """Find transformer blocks, with Gemma 3's text stack handled first."""
+    model = _unwrap_peft_model(model)
+
+    if hasattr(model, "model"):
+        backbone = model.model
+        if hasattr(backbone, "language_model") and hasattr(backbone.language_model, "layers"):
+            return list(backbone.language_model.layers)
+        if hasattr(backbone, "layers"):
+            return list(backbone.layers)
+
+    if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+        language_backbone = model.language_model.model
+        if hasattr(language_backbone, "layers"):
+            return list(language_backbone.layers)
+
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return list(model.transformer.h)
+    if hasattr(model, "gpt_neox") and hasattr(model.gpt_neox, "layers"):
+        return list(model.gpt_neox.layers)
+
     raise ValueError(
         "Could not locate transformer layers. Add your model's layer path to "
         "get_transformer_layers()."
@@ -142,3 +155,81 @@ def extract_layer_means_for_text(
     if missing:
         raise RuntimeError(f"Did not capture activations for layers: {missing}")
     return torch.stack([layer_means[layer_idx] for layer_idx in layer_indices], dim=0)
+
+
+def extract_layer_means_for_texts(
+    *,
+    model,
+    tokenizer,
+    texts: list[str],
+    layer_indices: list[int],
+    layers: list[torch.nn.Module],
+    start_token: int,
+    max_length: int | None,
+) -> torch.Tensor:
+    if start_token < 1:
+        raise ValueError("--start-token must be at least 1.")
+    if not texts:
+        return torch.empty((0, len(layer_indices), 0), dtype=torch.float32)
+
+    layer_means: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(layer_idx: int):
+        def hook_fn(_module, _inputs, output):
+            hidden = extract_hidden(output)
+            attention_mask = hook_fn.attention_mask.to(device=hidden.device)
+            token_numbers = attention_mask.cumsum(dim=1)
+            mean_mask = attention_mask.bool() & (token_numbers >= start_token)
+            mask = mean_mask.unsqueeze(-1).to(dtype=hidden.dtype)
+            summed = (hidden * mask).sum(dim=1)
+            counts = mask.sum(dim=1).clamp_min(1)
+            layer_means[layer_idx] = (
+                (summed / counts)
+                .detach()
+                .to(device="cpu", dtype=torch.float32)
+            )
+
+        return hook_fn
+
+    try:
+        hooks_by_layer = {}
+        for layer_idx in layer_indices:
+            hook = make_hook(layer_idx)
+            hooks_by_layer[layer_idx] = hook
+            handles.append(layers[layer_idx].register_forward_hook(hook))
+
+        tokenize_kwargs: dict[str, Any] = {
+            "return_tensors": "pt",
+            "return_token_type_ids": False,
+            "add_special_tokens": False,
+            "padding": True,
+            "truncation": max_length is not None,
+        }
+        if max_length is not None:
+            tokenize_kwargs["max_length"] = max_length
+
+        inputs = tokenizer(texts, **tokenize_kwargs)
+        attention_mask = inputs["attention_mask"]
+        token_counts = attention_mask.sum(dim=1)
+        if torch.any(token_counts < start_token):
+            raise ValueError(
+                f"At least one text has fewer than --start-token {start_token} "
+                f"tokens after tokenization: {token_counts.tolist()}."
+            )
+
+        for hook in hooks_by_layer.values():
+            hook.attention_mask = attention_mask
+
+        inputs = {key: value.to(first_model_device(model)) for key, value in inputs.items()}
+        with torch.inference_mode():
+            model(**inputs, use_cache=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    missing = [layer_idx for layer_idx in layer_indices if layer_idx not in layer_means]
+    if missing:
+        raise RuntimeError(f"Did not capture activations for layers: {missing}")
+
+    return torch.stack([layer_means[layer_idx] for layer_idx in layer_indices], dim=1)

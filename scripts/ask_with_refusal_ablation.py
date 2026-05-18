@@ -36,7 +36,13 @@ from src.activations import (
     replace_hidden,
 )
 from src.io import load_questions
-from src.modeling import format_chat_prompt, generate_answer, load_tokenizer_and_model
+from src.modeling import (
+    format_chat_prompt,
+    generate_answer,
+    generate_answers_batch,
+    get_model_hidden_size,
+    load_tokenizer_and_model,
+)
 
 
 DEFAULT_REGION_WEIGHTS = {
@@ -154,8 +160,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--output", type=Path, default=Path("answers.jsonl"))
-    parser.add_argument("--max-new-tokens", type=int, default=300)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of questions to generate in each model.generate call.",
+    )
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument(
         "--dtype",
@@ -175,6 +187,8 @@ def main() -> None:
     args = parse_args()
     if args.max_new_tokens < 1:
         raise ValueError("--max-new-tokens must be at least 1.")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
 
     questions = load_questions(args.questions_json)
     refusal_dirs = load_refusal_directions(args.refusal_directions)
@@ -192,6 +206,12 @@ def main() -> None:
             f"Refusal directions cover {refusal_dirs.shape[0]} layers, but the "
             f"model exposes {len(layers)} layers."
         )
+    model_hidden_dim = get_model_hidden_size(model)
+    if refusal_dirs.shape[1] != model_hidden_dim:
+        raise ValueError(
+            f"Refusal directions hidden_dim={refusal_dirs.shape[1]} does not match "
+            f"model hidden_size={model_hidden_dim}."
+        )
 
     handles = []
     ablation_layers = list(range(refusal_dirs.shape[0]))
@@ -203,31 +223,51 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
         with args.output.open("w") as f:
-            for index, question in enumerate(questions, start=1):
-                prompt = format_chat_prompt(tokenizer, question)
-                answer = generate_answer(
-                    model,
-                    tokenizer,
-                    prompt,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                )
-                row = {
-                    "index": index,
-                    "question": question,
-                    "answer": answer,
-                    "model_id": args.model_id,
-                    "refusal_directions": str(args.refusal_directions),
-                    "ablation_layers": ablation_layers,
-                    "ablation_weight_source": "03d_region_weights",
-                    "max_new_tokens": args.max_new_tokens,
-                    "temperature": args.temperature,
-                    "top_p": args.top_p,
-                }
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                f.flush()
-                print(f"{index}. {answer}\n")
+            for batch_start in range(0, len(questions), args.batch_size):
+                batch_questions = questions[batch_start : batch_start + args.batch_size]
+                prompts = [
+                    format_chat_prompt(tokenizer, question)
+                    for question in batch_questions
+                ]
+                if args.batch_size == 1:
+                    answers = [
+                        generate_answer(
+                            model,
+                            tokenizer,
+                            prompts[0],
+                            max_new_tokens=args.max_new_tokens,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                        )
+                    ]
+                else:
+                    answers = generate_answers_batch(
+                        model,
+                        tokenizer,
+                        prompts,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                    )
+
+                for offset, (question, answer) in enumerate(
+                    zip(batch_questions, answers), start=1
+                ):
+                    index = batch_start + offset
+                    row = {
+                        "index": index,
+                        "question": question,
+                        "answer": answer,
+                        "model_id": args.model_id,
+                        "refusal_directions": str(args.refusal_directions),
+                        "max_new_tokens": args.max_new_tokens,
+                        "batch_size": args.batch_size,
+                        "temperature": args.temperature,
+                        "top_p": args.top_p,
+                    }
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    f.flush()
+                    print(f"{index}. {answer}\n")
     finally:
         for handle in handles:
             handle.remove()

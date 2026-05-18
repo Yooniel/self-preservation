@@ -51,6 +51,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.activations import (
     extract_layer_means_for_text,
+    extract_layer_means_for_texts,
     get_transformer_layers,
     parse_layer_spec,
 )
@@ -60,7 +61,12 @@ from src.io import (
     read_text_items,
     write_jsonl,
 )
-from src.modeling import format_chat_prompt, generate_answer, load_tokenizer_and_model
+from src.modeling import (
+    format_chat_prompt,
+    generate_answer,
+    generate_answers_batch,
+    load_tokenizer_and_model,
+)
 
 
 def build_story_prompt(
@@ -123,10 +129,13 @@ def generate_stories(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    batch_size: int,
     overwrite: bool,
 ) -> list[dict[str, Any]]:
     if stories_per_pair < 1:
         raise ValueError("--stories-per-pair must be at least 1.")
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
     if stories_path.exists() and not overwrite:
         print(f"Using existing stories at {stories_path}. Pass --overwrite to regenerate.")
         return load_stories(stories_path)
@@ -135,12 +144,9 @@ def generate_stories(
     emotions = read_text_items(emotions_path)
     template = load_template(template_path)
 
-    records: list[dict[str, Any]] = []
-    total = len(topics) * len(emotions)
-    current = 0
+    tasks: list[dict[str, Any]] = []
     for topic_idx, topic in enumerate(topics):
         for emotion_idx, emotion in enumerate(emotions):
-            current += 1
             user_prompt = build_story_prompt(
                 template,
                 topic,
@@ -148,31 +154,66 @@ def generate_stories(
                 story_index=1,
                 n_stories=stories_per_pair,
             )
-            prompt = format_chat_prompt(tokenizer, user_prompt)
-            print(f"[{current}/{total}] topic={topic!r} emotion={emotion!r}")
-            output = generate_answer(
+            tasks.append(
+                {
+                    "topic": topic,
+                    "topic_idx": topic_idx,
+                    "emotion": emotion,
+                    "emotion_idx": emotion_idx,
+                    "prompt": user_prompt,
+                }
+            )
+
+    records: list[dict[str, Any]] = []
+    total = len(tasks)
+    for batch_start in range(0, total, batch_size):
+        batch_tasks = tasks[batch_start : batch_start + batch_size]
+        prompts = [
+            format_chat_prompt(tokenizer, task["prompt"])
+            for task in batch_tasks
+        ]
+        for offset, task in enumerate(batch_tasks, start=1):
+            current = batch_start + offset
+            print(f"[{current}/{total}] topic={task['topic']!r} emotion={task['emotion']!r}")
+
+        if batch_size == 1:
+            outputs = [
+                generate_answer(
+                    model,
+                    tokenizer,
+                    prompts[0],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+            ]
+        else:
+            outputs = generate_answers_batch(
                 model,
                 tokenizer,
-                prompt,
+                prompts,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )
+
+        for task, output in zip(batch_tasks, outputs):
             stories = split_generated_stories(output, expected_count=stories_per_pair)
             if len(stories) != stories_per_pair:
                 print(
-                    f"Warning: parsed {len(stories)} stories for topic_idx={topic_idx}, "
-                    f"emotion_idx={emotion_idx}; expected {stories_per_pair}."
+                    f"Warning: parsed {len(stories)} stories for "
+                    f"topic_idx={task['topic_idx']}, emotion_idx={task['emotion_idx']}; "
+                    f"expected {stories_per_pair}."
                 )
             for story_index, story in enumerate(stories[:stories_per_pair], start=1):
                 records.append(
                     {
-                        "topic": topic,
-                        "topic_idx": topic_idx,
-                        "emotion": emotion,
-                        "emotion_idx": emotion_idx,
+                        "topic": task["topic"],
+                        "topic_idx": task["topic_idx"],
+                        "emotion": task["emotion"],
+                        "emotion_idx": task["emotion_idx"],
                         "story_index": story_index,
-                        "prompt": user_prompt,
+                        "prompt": task["prompt"],
                         "story": story,
                         "raw_generation": output,
                     }
@@ -265,10 +306,16 @@ def parse_args() -> argparse.Namespace:
         help="Generated or existing JSON/JSONL stories file.",
     )
     parser.add_argument("--output", type=Path, default=Path("emotion_vectors.pt"))
-    parser.add_argument("--stories-per-pair", type=int, default=1)
-    parser.add_argument("--generation-max-new-tokens", type=int, default=800)
+    parser.add_argument("--stories-per-pair", type=int, default=3)
+    parser.add_argument("--generation-max-new-tokens", type=int, default=2048)
     parser.add_argument("--generation-temperature", type=float, default=0.9)
     parser.add_argument("--generation-top-p", type=float, default=0.95)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of prompts/stories to process in each model call.",
+    )
     parser.add_argument(
         "--layers",
         default="all",
@@ -300,6 +347,8 @@ def main() -> None:
     args = parse_args()
     if args.start_token < 1:
         raise ValueError("--start-token must be at least 1.")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
 
     tokenizer, model = load_tokenizer_and_model(
         args.model_id,
@@ -320,6 +369,7 @@ def main() -> None:
             max_new_tokens=args.generation_max_new_tokens,
             temperature=args.generation_temperature,
             top_p=args.generation_top_p,
+            batch_size=args.batch_size,
             overwrite=args.overwrite,
         )
     else:
@@ -334,22 +384,39 @@ def main() -> None:
     emotion_sums: dict[str, torch.Tensor] = {}
     emotion_counts: dict[str, int] = defaultdict(int)
 
-    for index, record in enumerate(stories, start=1):
-        emotion = record["emotion"]
-        print(f"[{index}/{len(stories)}] {emotion}")
-        layer_means = extract_layer_means_for_text(
-            model=model,
-            tokenizer=tokenizer,
-            text=record["story"],
-            layer_indices=layer_indices,
-            layers=layers,
-            start_token=args.start_token,
-            max_length=args.max_length,
-        )
-        if emotion not in emotion_sums:
-            emotion_sums[emotion] = torch.zeros_like(layer_means)
-        emotion_sums[emotion] += layer_means
-        emotion_counts[emotion] += 1
+    for batch_start in range(0, len(stories), args.batch_size):
+        batch_records = stories[batch_start : batch_start + args.batch_size]
+        for offset, record in enumerate(batch_records, start=1):
+            index = batch_start + offset
+            print(f"[{index}/{len(stories)}] {record['emotion']}")
+
+        if args.batch_size == 1:
+            batch_layer_means = extract_layer_means_for_text(
+                model=model,
+                tokenizer=tokenizer,
+                text=batch_records[0]["story"],
+                layer_indices=layer_indices,
+                layers=layers,
+                start_token=args.start_token,
+                max_length=args.max_length,
+            ).unsqueeze(0)
+        else:
+            batch_layer_means = extract_layer_means_for_texts(
+                model=model,
+                tokenizer=tokenizer,
+                texts=[record["story"] for record in batch_records],
+                layer_indices=layer_indices,
+                layers=layers,
+                start_token=args.start_token,
+                max_length=args.max_length,
+            )
+
+        for record, layer_means in zip(batch_records, batch_layer_means):
+            emotion = record["emotion"]
+            if emotion not in emotion_sums:
+                emotion_sums[emotion] = torch.zeros_like(layer_means)
+            emotion_sums[emotion] += layer_means
+            emotion_counts[emotion] += 1
 
     emotion_vectors, emotion_means = compute_emotion_vectors(emotion_sums, emotion_counts)
 
@@ -360,6 +427,7 @@ def main() -> None:
         "emotion_counts": dict(emotion_counts),
         "selected_layers": layer_indices,
         "start_token": args.start_token,
+        "batch_size": args.batch_size,
         "model_id": args.model_id,
         "stories_json": str(args.stories_json),
     }
@@ -372,6 +440,7 @@ def main() -> None:
         "output": str(args.output),
         "selected_layers": layer_indices,
         "start_token": args.start_token,
+        "batch_size": args.batch_size,
         "max_length": args.max_length,
         "emotion_counts": dict(emotion_counts),
         "vector_shapes": {
